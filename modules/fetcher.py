@@ -135,6 +135,18 @@ class MacroDataFetcher:
                    DataReliability.HIGH, Region.GLOBAL),
             "V10": (SectorType.LIQUIDITY, "API", "tether", "테더(USDT) 시총",
                     DataReliability.MEDIUM, Region.GLOBAL),
+            "V11": (SectorType.LIQUIDITY, "YF", "SI=F", "은 선물(안전자산)",
+                    DataReliability.HIGH, Region.GLOBAL),
+
+            # ===== 미국 주요 지수 =====
+            "U1": (SectorType.SENTIMENT, "YF", "^GSPC", "S&P 500",
+                   DataReliability.HIGH, Region.US),
+            "U2": (SectorType.SENTIMENT, "YF", "^IXIC", "나스닥 종합",
+                   DataReliability.HIGH, Region.US),
+            "U3": (SectorType.SENTIMENT, "YF", "^DJI", "다우존스",
+                   DataReliability.HIGH, Region.US),
+            "U4": (SectorType.SENTIMENT, "YF", "^NDX", "나스닥 100",
+                   DataReliability.HIGH, Region.US),
 
             # ===== 4. Volatility & Sentiment (심리) - 변동성 및 투자심리 =====
             "S1": (SectorType.SENTIMENT, "YF", "^VIX", "VIX 공포지수",
@@ -398,32 +410,65 @@ class MacroDataFetcher:
 
     def _fetch_custom(self, ticker: str) -> Optional[pd.Series]:
         """
-        커스텀 지표 수집 (플레이스홀더)
-
-        TODO: 실제 API 연동 필요
-        - CBOE_PCCR: CBOE Put/Call Ratio (CBOE 웹사이트)
-        - FNG: Fear & Greed Index (CNN 또는 alternative.me)
-        - BTC_FUNDING: 비트코인 펀딩비 (Binance/Bybit API)
-
-        현재는 시뮬레이션 데이터 반환
+        커스텀 지표 수집 (실제 API 연동)
+        - CBOE_PCCR: yfinance CBOE P/C ratio proxy (VIX/20 정규화)
+        - FNG: Alternative.me Fear & Greed Index (무료)
+        - BTC_FUNDING: Binance BTC 펀딩비 (무료)
         """
-        # 기본값 설정 (현실적인 범위)
-        placeholder_data = {
-            "CBOE_PCCR": 0.85,      # Put/Call Ratio (0.5~1.5 범위)
-            "FNG": 50,              # Fear & Greed (0~100)
-            "BTC_FUNDING": 0.01,    # 펀딩비 (0.01% = 연 36.5%)
-        }
+        try:
+            if ticker == "FNG":
+                return self._fetch_fear_greed()
+            elif ticker == "BTC_FUNDING":
+                return self._fetch_btc_funding()
+            elif ticker == "CBOE_PCCR":
+                return self._fetch_put_call_ratio()
+        except Exception as e:
+            logger.warning(f"커스텀 지표 [{ticker}] 수집 실패: {e}")
 
-        value = placeholder_data.get(ticker, 0.5)
-        dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
+        return None
 
-        # 약간의 변동성 추가 (시뮬레이션)
-        import numpy as np
-        np.random.seed(42)
-        noise = np.random.normal(0, value * 0.1, 100)
-        values = [value + n for n in noise]
+    def _fetch_fear_greed(self) -> Optional[pd.Series]:
+        """Alternative.me Fear & Greed Index (무료, 키 불필요)"""
+        url = "https://api.alternative.me/fng/?limit=100"
+        resp = self.session.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            if data:
+                dates = [datetime.fromtimestamp(int(d["timestamp"])) for d in data]
+                vals = [int(d["value"]) for d in data]
+                series = pd.Series(vals, index=dates).sort_index()
+                logger.info(f"  📊 F&G 수집 성공: {vals[0]} ({data[0].get('value_classification', '')})")
+                return series
+        return None
 
-        return pd.Series(values, index=dates, name=ticker)
+    def _fetch_btc_funding(self) -> Optional[pd.Series]:
+        """Binance BTC 펀딩비 (무료, 키 불필요)"""
+        url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        params = {"symbol": "BTCUSDT", "limit": 100}
+        resp = self.session.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                dates = [datetime.fromtimestamp(d["fundingTime"] / 1000) for d in data]
+                vals = [float(d["fundingRate"]) * 100 for d in data]  # → %
+                series = pd.Series(vals, index=dates).sort_index()
+                logger.info(f"  📊 BTC 펀딩비 수집 성공: {vals[-1]:.4f}%")
+                return series
+        return None
+
+    def _fetch_put_call_ratio(self) -> Optional[pd.Series]:
+        """Put/Call Ratio proxy — VIX 기반 추정"""
+        import yfinance as yf
+        vix = yf.download("^VIX", period="6mo", progress=False)
+        if vix.empty:
+            return None
+        close = vix["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        # VIX 20 = P/C 0.85 기준, VIX 30 = P/C ~1.2 추정
+        pc_ratio = close / 20.0 * 0.85
+        logger.info(f"  📊 P/C Ratio(VIX proxy) 수집 성공: {pc_ratio.iloc[-1]:.3f}")
+        return pc_ratio
 
     def _fetch_bok(self, ticker: str, name: str) -> Optional[pd.Series]:
         """
